@@ -52,3 +52,12 @@ product (live exporter round-trip proves the product side). Green for publish.
 ## Iteration
 2 of 5. Recommend PASS for publish gate; remaining note 1 closes itself on any
 future regression run.
+
+## Note 1 CLOSED (same iteration, post-publish run with consent cleared)
+Full independent harness re-ran clean: **FAILS: 0** across all 7 combos —
+fixture ×5 plus prom-edge `[]` (3 rows == 3 series) and `--top 2` (2==2), now
+value-exact on the adversarial tab/quote/backslash tree with the documented
+tab→space label policy applied on my side. Live scrape re-confirmed in the same
+run: 13 series, escape round-trip 3/3, 0 collisions. No product change needed
+or made — this closes the labeled verification gap in the published report.
+Final verdict unchanged: **PASS**.
