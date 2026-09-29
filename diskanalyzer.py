@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""diskanalyze — terminal disk-usage analyzer, v1.3.0.
+"""diskanalyze — terminal disk-usage analyzer, v1.3.1.
 
-Current: v1.3.0 — Prometheus textfile-collector output (--prom stdout /
+Current: v1.3.1 — exposition output interleaves HELP/TYPE above each
+family (canonical spec-example layout; both groupings are legal).
+v1.3.0 — Prometheus textfile-collector output (--prom stdout /
 --prom-out atomic file, exposition format — node_exporter does NOT parse
 TOML/JSON). v1.2 perf pass (C-level DirEntry predicates, lock-churn and
 aggregation rework, ~1.15-1.26x faster scan depending on host) plus security
@@ -68,7 +70,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 
 @dataclass
@@ -790,56 +792,56 @@ def prom_lines(s: "Scanner", elapsed: float, top: int) -> list:
     mode = "apparent" if s.apparent else "allocated"
     path = s.root
     out = []
-    help_type = [
-        ("# HELP diskanalyze_scan_success 1 when the last scan completed.",
-         "# TYPE diskanalyze_scan_success gauge"),
-        ("# HELP diskanalyze_scan_timestamp_seconds Unix time of scan completion.",
-         "# TYPE diskanalyze_scan_timestamp_seconds gauge"),
-        ("# HELP diskanalyze_scan_duration_seconds Wall-clock scan time.",
-         "# TYPE diskanalyze_scan_duration_seconds gauge"),
-        ("# HELP diskanalyze_scan_bytes Total bytes under the scanned path.",
-         "# TYPE diskanalyze_scan_bytes gauge"),
-        ("# HELP diskanalyze_scan_files File count under the scanned path.",
-         "# TYPE diskanalyze_scan_files gauge"),
-        ("# HELP diskanalyze_scan_directories Directory count under the scanned path.",
-         "# TYPE diskanalyze_scan_directories gauge"),
-        ("# HELP diskanalyze_scan_warnings Unreadable entries during the scan.",
-         "# TYPE diskanalyze_scan_warnings gauge"),
-        ("# HELP diskanalyze_dir_bytes Rollup bytes for a top-level directory of the scan root.",
-         "# TYPE diskanalyze_dir_bytes gauge"),
-        ("# HELP diskanalyze_filesystem_bytes Filesystem size from statvfs at the scan root's mount (path = scan root, so two roots on one mount coexist).",
-         "# TYPE diskanalyze_filesystem_bytes gauge"),
-    ]
-    for h in help_type:
-        out.extend(h)
+
+    def family(name, help_text, samples):
+        """HELP + TYPE immediately above the family's samples — the
+        canonical interleaved layout from the exposition-format spec
+        examples (the all-headers-first grouping is also legal, but reads
+        like the metadata is mixed with the data; interleaving is what
+        humans expect to eyeball). TYPE always precedes first sample."""
+        out.append(f"# HELP {name} {help_text}")
+        out.append(f"# TYPE {name} gauge")
+        out.extend(samples)
+
     # path label on the run-status family too (v1.3 QA F1): two .prom files
     # from different scans in one collector dir otherwise collide on these
     # label-less samples and node_exporter drops the ENTIRE diskanalyze
     # gather for both files ("collected ... with the same name and label
     # values"). With path=, per-scan stale alerts also key cleanly.
-    out.append(_prom_sample("diskanalyze_scan_success", {"path": path}, 1))
-    out.append(_prom_sample("diskanalyze_scan_timestamp_seconds",
-                            {"path": path}, f"{time.time():.3f}"))
-    out.append(_prom_sample("diskanalyze_scan_duration_seconds",
-                            {"path": path}, f"{elapsed:.3f}"))
-    out.append(_prom_sample("diskanalyze_scan_bytes",
-                            {"path": path, "mode": mode}, s.dirs[""].total))
-    out.append(_prom_sample("diskanalyze_scan_files", {"path": path},
-                            sum(1 for f in s.files if f.kind == "file")))
-    out.append(_prom_sample("diskanalyze_scan_directories", {"path": path},
-                            len(s.dirs)))
-    out.append(_prom_sample("diskanalyze_scan_warnings", {"path": path},
-                            len(s.warnings)))
+    family("diskanalyze_scan_success", "1 when the last scan completed.",
+           [_prom_sample("diskanalyze_scan_success", {"path": path}, 1)])
+    family("diskanalyze_scan_timestamp_seconds", "Unix time of scan completion.",
+           [_prom_sample("diskanalyze_scan_timestamp_seconds",
+                         {"path": path}, f"{time.time():.3f}")])
+    family("diskanalyze_scan_duration_seconds", "Wall-clock scan time.",
+           [_prom_sample("diskanalyze_scan_duration_seconds",
+                         {"path": path}, f"{elapsed:.3f}")])
+    family("diskanalyze_scan_bytes", "Total bytes under the scanned path.",
+           [_prom_sample("diskanalyze_scan_bytes",
+                         {"path": path, "mode": mode}, s.dirs[""].total)])
+    family("diskanalyze_scan_files", "File count under the scanned path.",
+           [_prom_sample("diskanalyze_scan_files", {"path": path},
+                         sum(1 for f in s.files if f.kind == "file"))])
+    family("diskanalyze_scan_directories",
+           "Directory count under the scanned path.",
+           [_prom_sample("diskanalyze_scan_directories", {"path": path},
+                         len(s.dirs))])
+    family("diskanalyze_scan_warnings",
+           "Unreadable entries during the scan.",
+           [_prom_sample("diskanalyze_scan_warnings", {"path": path},
+                         len(s.warnings))])
     # top-level child rollups (dirs directly under root), capped at top N
     root_prefix = path.rstrip("/") + "/"
     children = [(d.relpath, d.total) for d in s.dirs.values()
                 if d.relpath and "/" not in d.relpath]
     children.sort(key=lambda kv: (-kv[1], kv[0]))
-    for rel, total in children[:max(top, 0)]:
-        out.append(_prom_sample("diskanalyze_dir_bytes",
-                                {"path": root_prefix + rel, "mode": mode},
-                                total))
+    family("diskanalyze_dir_bytes",
+           "Rollup bytes for a top-level directory of the scan root.",
+           [_prom_sample("diskanalyze_dir_bytes",
+                         {"path": root_prefix + rel, "mode": mode}, total)
+            for rel, total in children[:max(top, 0)]])
     # filesystem-level context for the scanned mount
+    fs_samples = []
     try:
         st = os.statvfs(path)
         mnt = _mount_for(path)
@@ -851,11 +853,16 @@ def prom_lines(s: "Scanner", elapsed: float, top: int) -> list:
             # path label required (v1.3 QA F1b): two scan roots on the SAME
             # mount (e.g. /data and /var on one fs) collide on mount+state
             # and node_exporter drops the whole gather.
-            out.append(_prom_sample("diskanalyze_filesystem_bytes",
-                                    {"path": path, "mount": mnt,
-                                     "state": state}, v))
+            fs_samples.append(_prom_sample("diskanalyze_filesystem_bytes",
+                                           {"path": path, "mount": mnt,
+                                            "state": state}, v))
     except OSError:
         pass
+    if fs_samples:  # don't emit HELP/TYPE for a family with no samples
+        family("diskanalyze_filesystem_bytes",
+               "Filesystem size from statvfs at the scan root's mount "
+               "(path = scan root, so two roots on one mount coexist).",
+               fs_samples)
     return out
 
 

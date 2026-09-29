@@ -1,7 +1,7 @@
-# diskanalyzer — Howto (v1.3.0)
+# diskanalyzer — Howto (v1.3.1)
 
 Single-file, stdlib-only Python (3.12+), read-only disk-usage analyzer with
-du-exact semantics. Canonical source: `./diskanalyzer.py` (frozen dev-side at 1.3.0).
+du-exact semantics. Canonical source: `./diskanalyzer.py` (frozen dev-side, see git log).
 Deploy anywhere: `cp diskanalyzer.py host:~/diskanalyzer && chmod +x`.
 
 ## Everyday
