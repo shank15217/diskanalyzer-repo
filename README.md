@@ -1,4 +1,4 @@
-# diskanalyzer — Howto (v1.3.1)
+# diskanalyzer — Howto (v1.4.0)
 
 Single-file, stdlib-only Python (3.12+), read-only disk-usage analyzer with
 du-exact semantics. Canonical source: `./diskanalyzer.py` (frozen dev-side, see git log).
@@ -49,7 +49,15 @@ monitoring data, not a diff baseline. Periodic refresh via cron:
 ```
 Metrics (all gauges): `diskanalyze_scan_{success,timestamp_seconds,
 duration_seconds,bytes,files,directories,warnings}`, `diskanalyze_dir_bytes`
-(top `--top` child rollups of the root), `diskanalyze_filesystem_bytes`
+(top `--top` child rollups of the root — **view parity (v1.4)**: the default
+ stdout "Top directories" list is this exact family, same flat depth-1 set,
+ same `--top` cap and sort, agreeing to the byte. **`--top` does double
+ duty:** it sizes the terminal list AND caps the scrape's `dir_bytes`
+ series count — `--top 5` in your cron line means Prometheus only ever
+ sees the 5 biggest children; a "missing directory" on a dashboard is
+ usually this, not a scan bug; drill down by rerunning the
+ tool on a chosen directory (du-style) or use `--tree` for the full walk),
+ `diskanalyze_filesystem_bytes`
 (statvfs of the root's mount). Every sample carries `path` (the scan root) so
 several scan roots can coexist as several `.prom` files in one collector dir
 — a colliding label set makes node_exporter drop the ENTIRE diskanalyze

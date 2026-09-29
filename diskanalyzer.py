@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""diskanalyze — terminal disk-usage analyzer, v1.3.1.
+"""diskanalyze — terminal disk-usage analyzer, v1.4.0.
 
-Current: v1.3.1 — exposition output interleaves HELP/TYPE above each
+Current: v1.4.0 — view parity: the stdout "Top directories" list and the
+--prom diskanalyze_dir_bytes family are now the SAME flat depth-1 child
+rollups (same set/cap/sort, agree to the byte). Deep inspection = rerun on
+a directory or use --tree; the old heaviest-chain top-dirs walk is dropped.
+v1.3.1 — exposition output interleaves HELP/TYPE above each
 family (canonical spec-example layout; both groupings are legal).
 v1.3.0 — Prometheus textfile-collector output (--prom stdout /
 --prom-out atomic file, exposition format — node_exporter does NOT parse
@@ -70,7 +74,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 
 @dataclass
@@ -754,6 +758,19 @@ def _prom_sample(name: str, labels: dict, value) -> str:
     return f"{name} {value}"
 
 
+def _depth1_children(s: "Scanner", top: int) -> list:
+    """Flat, deterministic top-level child rollups: directories directly
+    under the scan root, sorted (-total, relpath), capped at top. THE single
+    source of truth for both the stdout 'Top directories' list and the
+    diskanalyze_dir_bytes family — v1.4 view-parity rule: the two views must
+    agree byte-for-byte; drilling deeper = rerun the tool on that directory
+    (du-style), the tool itself never walks beyond depth 1 in these views."""
+    children = [(d.relpath, d.total) for d in s.dirs.values()
+                if d.relpath and "/" not in d.relpath]
+    children.sort(key=lambda kv: (-kv[1], kv[0]))
+    return children[:max(top, 0)]
+
+
 def _mount_for(path: str) -> str:
     """Longest mount-point prefix of path from /proc/mounts ('/' fallback).
     Octal escapes in /proc/mounts (\040 space etc.) are decoded first."""
@@ -832,9 +849,7 @@ def prom_lines(s: "Scanner", elapsed: float, top: int) -> list:
                          len(s.warnings))])
     # top-level child rollups (dirs directly under root), capped at top N
     root_prefix = path.rstrip("/") + "/"
-    children = [(d.relpath, d.total) for d in s.dirs.values()
-                if d.relpath and "/" not in d.relpath]
-    children.sort(key=lambda kv: (-kv[1], kv[0]))
+    children = _depth1_children(s, top)
     family("diskanalyze_dir_bytes",
            "Rollup bytes for a top-level directory of the scan root.",
            [_prom_sample("diskanalyze_dir_bytes",
@@ -1078,11 +1093,12 @@ def emit_table(s: Scanner, top: int, min_bytes: int) -> None:
           f"Dirs: {len(s.dirs):>5}   Total: {human(root_total)}")
     print()
 
-    top_dirs = [d for d in s.dirs.values() if d.relpath and d.total > 0]
-    top_dirs.sort(key=lambda d: (-d.total, d.relpath))
-    print("Top directories:")
-    for d in top_dirs[:10]:
-        print(f"  {human(d.total):>12}  {d.relpath}/")
+    # v1.4 view-parity: same flat depth-1 rollups as diskanalyze_dir_bytes
+    # (--prom), same --top cap, same sort. Deeper inspection = rerun on the
+    # directory (du-style drill-down) or use --tree for the full walk.
+    print(f"Top directories (depth 1; rerun on a directory to drill deeper):")
+    for rel, total in _depth1_children(s, top):
+        print(f"  {human(total):>12}  {rel}/")
     print()
 
     files = [f for f in s.files if s._size_of(f) >= min_bytes]
