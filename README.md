@@ -1,8 +1,7 @@
-# diskanalyzer — Howto (v1.2.1)
+# diskanalyzer — Howto (v1.3.0)
 
 Single-file, stdlib-only Python (3.12+), read-only disk-usage analyzer with
-du-exact semantics. Canonical source: `./diskanalyzer/diskanalyzer.py`
-(frozen target `diskanalyzer-1.2.1.py.orig`, git `d802015` + doc pass).
+du-exact semantics. Canonical source: `./diskanalyzer.py` (frozen dev-side at 1.3.0).
 Deploy anywhere: `cp diskanalyzer.py host:~/diskanalyzer && chmod +x`.
 
 ## Everyday
@@ -33,6 +32,30 @@ diskanalyzer /usr --csv > files.csv       # caveat: =+-@-prefixed filenames are
                                           # via the wizard, don't double-click
 diskanalyzer /usr --tree-csv > dirs.csv   # per-directory rollup only
 ```
+
+## Prometheus (node_exporter textfile collector)
+The textfile collector parses ONLY Prometheus exposition format (`*.prom`) —
+JSON/TOML files in the directory are silently ignored. Two emitters:
+```bash
+diskanalyzer /data --prom                    # exposition to stdout (NOT atomic
+                                             # through shell '>' — prefer below)
+diskanalyzer /data --prom-out /var/lib/node_exporter/diskanalyze.prom
+```
+`--prom-out` writes temp+rename (atomic: a scrape never reads a partial file),
+mode 0644, overwrites every run without `--force` — it is regenerated
+monitoring data, not a diff baseline. Periodic refresh via cron:
+```
+* * * * * /usr/local/bin/diskanalyzer /data --prom-out /var/lib/node_exporter/diskanalyze.prom
+```
+Metrics (all gauges): `diskanalyze_scan_{success,timestamp_seconds,
+duration_seconds,bytes,files,directories,warnings}`, `diskanalyze_dir_bytes`
+(top `--top` child rollups of the root), `diskanalyze_filesystem_bytes`
+(statvfs of the root's mount). Every sample carries `path` (the scan root) so
+several scan roots can coexist as several `.prom` files in one collector dir
+— a colliding label set makes node_exporter drop the ENTIRE diskanalyze
+gather, which is why no family is label-less. `mode` is `allocated`/`apparent`.
+Failure model: a crashed run never touches the file, so alert on staleness,
+e.g. `time() - diskanalyze_scan_timestamp_seconds > 2 * <refresh interval>`.
 
 ## Semantics you should know
 - Default = **allocated** bytes (`du -s`); `--apparent` = `du -sb`. Directory

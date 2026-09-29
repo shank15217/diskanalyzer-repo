@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""diskanalyze — terminal disk-usage analyzer, v1.2.1.
+"""diskanalyze — terminal disk-usage analyzer, v1.3.0.
 
-Current: v1.2.1 — perf pass (1.2: C-level DirEntry predicates, lock-churn and
+Current: v1.3.0 — Prometheus textfile-collector output (--prom stdout /
+--prom-out atomic file, exposition format — node_exporter does NOT parse
+TOML/JSON). v1.2 perf pass (C-level DirEntry predicates, lock-churn and
 aggregation rework, ~1.15-1.26x faster scan depending on host) plus security
 polish (1.2.1: snapshot clobber guard + --force, atomic 0600 temp-rename
 writer, CSV formula-prefix note). v1.0 added: --version, --snapshot/--diff
@@ -58,6 +60,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import threading
@@ -65,7 +68,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 
 @dataclass
@@ -718,6 +721,178 @@ def emit_by_owner(s: Scanner, top: int) -> None:
         print(f"  {human(sz):>12}  {pct:5.1f}%  {n:>8,} files  {gname(gid)} ({gid})")
 
 
+# -- v1.3 Prometheus textfile-collector emission ----------------------------
+# node_exporter's textfile collector parses ONLY the Prometheus exposition
+# format (*.prom) — it does not read TOML/JSON. --prom prints that format on
+# stdout (shell-redirectable); --prom-out writes it atomically (temp +
+# os.replace) so a scrape never sees a half-written file.
+_METRIC_NAME_RE = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
+
+
+def _prom_escape_label(v: str) -> str:
+    """Escape a label value per the exposition spec: backslash, quote, then
+    newline. Remaining control chars (\t, \r, \x00...) are stripped — a raw
+    control byte would corrupt the sample line for the parser. Filenames can
+    contain any byte except / and NUL, so this path is load-bearing."""
+    v = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    # \\t is NOT a valid exposition escape (strict parsers reject unknown
+    # escapes); other C0 controls would corrupt the line. Normalise to space.
+    v = "".join(" " if (ch < " " and ch != "\n") else ch for ch in v)
+    return v
+
+
+def _prom_sample(name: str, labels: dict, value) -> str:
+    """One 'name{k=\"v\",...} value' line. Asserts the metric name shape
+    (programmer error otherwise) and sanitizes every label value."""
+    assert _METRIC_NAME_RE.match(name), name
+    if labels:
+        lab = ",".join(f'{k}="{_prom_escape_label(str(v))}"'
+                       for k, v in labels.items())
+        return f"{name}{{{lab}}} {value}"
+    return f"{name} {value}"
+
+
+def _mount_for(path: str) -> str:
+    """Longest mount-point prefix of path from /proc/mounts ('/' fallback).
+    Octal escapes in /proc/mounts (\040 space etc.) are decoded first."""
+    best = "/"
+    try:
+        with open("/proc/mounts") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                mnt = (parts[1].replace("\\040", " ").replace("\\011", "\t")
+                       .replace("\\012", "\n").replace("\\134", "\\"))
+                if mnt == "/" or path == mnt or path.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > len(best):
+                        best = mnt
+    except OSError:
+        pass
+    return best
+
+
+def prom_lines(s: "Scanner", elapsed: float, top: int) -> list:
+    """Build the exposition lines for one scan. Metric families (all gauges):
+      diskanalyze_scan_timestamp_seconds   — wall clock of scan completion
+      diskanalyze_scan_duration_seconds
+      diskanalyze_scan_success             — always 1 here: a run that fails
+        never writes/updates the file, so staleness (time() - timestamp) plus
+        absence of a fresh success=1 is the failure signal
+      diskanalyze_scan_bytes{path,mode}    — total for the scan root
+      diskanalyze_scan_files{path}
+      diskanalyze_scan_directories{path}
+      diskanalyze_scan_warnings{path}
+      diskanalyze_dir_bytes{path,mode}     — top-level child rollups, top N
+        by size (cardinality cap: N labels per run, not one per directory)
+      diskanalyze_filesystem_bytes{mount,state="total|used|available"}
+    mode is 'allocated' or 'apparent' to match the scanner."""
+    mode = "apparent" if s.apparent else "allocated"
+    path = s.root
+    out = []
+    help_type = [
+        ("# HELP diskanalyze_scan_success 1 when the last scan completed.",
+         "# TYPE diskanalyze_scan_success gauge"),
+        ("# HELP diskanalyze_scan_timestamp_seconds Unix time of scan completion.",
+         "# TYPE diskanalyze_scan_timestamp_seconds gauge"),
+        ("# HELP diskanalyze_scan_duration_seconds Wall-clock scan time.",
+         "# TYPE diskanalyze_scan_duration_seconds gauge"),
+        ("# HELP diskanalyze_scan_bytes Total bytes under the scanned path.",
+         "# TYPE diskanalyze_scan_bytes gauge"),
+        ("# HELP diskanalyze_scan_files File count under the scanned path.",
+         "# TYPE diskanalyze_scan_files gauge"),
+        ("# HELP diskanalyze_scan_directories Directory count under the scanned path.",
+         "# TYPE diskanalyze_scan_directories gauge"),
+        ("# HELP diskanalyze_scan_warnings Unreadable entries during the scan.",
+         "# TYPE diskanalyze_scan_warnings gauge"),
+        ("# HELP diskanalyze_dir_bytes Rollup bytes for a top-level directory of the scan root.",
+         "# TYPE diskanalyze_dir_bytes gauge"),
+        ("# HELP diskanalyze_filesystem_bytes Filesystem size from statvfs at the scan root's mount (path = scan root, so two roots on one mount coexist).",
+         "# TYPE diskanalyze_filesystem_bytes gauge"),
+    ]
+    for h in help_type:
+        out.extend(h)
+    # path label on the run-status family too (v1.3 QA F1): two .prom files
+    # from different scans in one collector dir otherwise collide on these
+    # label-less samples and node_exporter drops the ENTIRE diskanalyze
+    # gather for both files ("collected ... with the same name and label
+    # values"). With path=, per-scan stale alerts also key cleanly.
+    out.append(_prom_sample("diskanalyze_scan_success", {"path": path}, 1))
+    out.append(_prom_sample("diskanalyze_scan_timestamp_seconds",
+                            {"path": path}, f"{time.time():.3f}"))
+    out.append(_prom_sample("diskanalyze_scan_duration_seconds",
+                            {"path": path}, f"{elapsed:.3f}"))
+    out.append(_prom_sample("diskanalyze_scan_bytes",
+                            {"path": path, "mode": mode}, s.dirs[""].total))
+    out.append(_prom_sample("diskanalyze_scan_files", {"path": path},
+                            sum(1 for f in s.files if f.kind == "file")))
+    out.append(_prom_sample("diskanalyze_scan_directories", {"path": path},
+                            len(s.dirs)))
+    out.append(_prom_sample("diskanalyze_scan_warnings", {"path": path},
+                            len(s.warnings)))
+    # top-level child rollups (dirs directly under root), capped at top N
+    root_prefix = path.rstrip("/") + "/"
+    children = [(d.relpath, d.total) for d in s.dirs.values()
+                if d.relpath and "/" not in d.relpath]
+    children.sort(key=lambda kv: (-kv[1], kv[0]))
+    for rel, total in children[:max(top, 0)]:
+        out.append(_prom_sample("diskanalyze_dir_bytes",
+                                {"path": root_prefix + rel, "mode": mode},
+                                total))
+    # filesystem-level context for the scanned mount
+    try:
+        st = os.statvfs(path)
+        mnt = _mount_for(path)
+        total_fs = st.f_blocks * st.f_frsize
+        used_fs = total_fs - st.f_bfree * st.f_frsize
+        avail_fs = st.f_bavail * st.f_frsize
+        for state, v in (("total", total_fs), ("used", used_fs),
+                         ("available", avail_fs)):
+            # path label required (v1.3 QA F1b): two scan roots on the SAME
+            # mount (e.g. /data and /var on one fs) collide on mount+state
+            # and node_exporter drops the whole gather.
+            out.append(_prom_sample("diskanalyze_filesystem_bytes",
+                                    {"path": path, "mount": mnt,
+                                     "state": state}, v))
+    except OSError:
+        pass
+    return out
+
+
+def emit_prom(s: "Scanner", elapsed: float, top: int) -> None:
+    """Print exposition format to stdout (--prom)."""
+    for line in prom_lines(s, elapsed, top):
+        print(line)
+
+
+def write_prom(s: "Scanner", path: str, elapsed: float, top: int) -> None:
+    """Atomically write exposition text to path (--prom-out). Unlike
+    --snapshot this OVERWRITES without --force: the file is regenerated
+    monitoring data, not a diff baseline. Temp file is unique per process in
+    the target directory (same fs => os.replace is atomic); the collector
+    only reads *.prom so the .tmp.<pid> name is invisible to it. Mode 0644:
+    node_exporter typically runs as another user and must read it."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    tmp = os.path.join(d, f".{os.path.basename(path)}.tmp.{os.getpid()}")
+    body = "\n".join(prom_lines(s, elapsed, top)) + "\n"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as e:
+        print(f"error: cannot write prom file: {e}", file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
+        os.replace(tmp, path)          # atomic swap on same fs
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        print(f"error: cannot write prom file: {e}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def emit_mounts() -> int:
     """df-style overview of every mounted filesystem: parse /proc/mounts,
     os.statvfs each mount point, skip pseudo-filesystems."""
@@ -1030,6 +1205,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mounts", action="store_true",
                     help="df-style overview of every real filesystem, sorted "
                          "by use%% (no scan needed)")
+    ap.add_argument("--prom", action="store_true",
+                    help="print Prometheus exposition format to stdout "
+                         "(redirect into the node_exporter textfile-collector "
+                         "dir; for periodic use prefer --prom-out, which "
+                         "writes atomically so a scrape never reads a partial "
+                         "file)")
+    ap.add_argument("--prom-out", metavar="FILE",
+                    help="write Prometheus exposition format to FILE "
+                         "atomically (temp + rename, mode 0644); overwrites "
+                         "on each run — designed for cron/systemd-timer "
+                         "refresh into the textfile collector directory")
     ap.add_argument("--interactive", action="store_true",
                     help="ncdu-style curses drill-down of the scan "
                          "(↑↓/jk move, Enter descend, h up, q quit)")
@@ -1085,6 +1271,10 @@ def main(argv: list[str] | None = None) -> int:
         emit_by_type(s, args.top, args.min_bytes)
     elif args.by_owner:
         emit_by_owner(s, args.top)
+    elif args.prom:
+        emit_prom(s, elapsed, args.top)
+    elif args.prom_out:
+        write_prom(s, args.prom_out, elapsed, args.top)
     elif args.tree_csv:
         emit_tree_csv(s)
     elif args.tree_json:
